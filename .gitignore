@@ -1,0 +1,5 @@
+node_modules/
+vpn/
+.env
+*.log
+.DS_Store
