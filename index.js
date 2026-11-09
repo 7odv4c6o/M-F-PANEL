@@ -17,7 +17,7 @@ const crypto = require("crypto");
 const zlib = require("zlib");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "mf-panel-katabump-1.1";
+const VERSION = "mf-panel-1.2";
 const BRAND = "M&F Panel";
 
 const BRAND_FILES = {
@@ -30,10 +30,23 @@ const VPN_URL = "https://github.com/Sir-MmD/vpn-ui/releases/download/v1.9.4/vpn-
 const VPN_SHA = "18ec321d9074b319bd5756508bbc523ab5d95450b832c406acdd72e987a2da8f";
 const PANEL_PORT = 18080;
 const USER_PORT = 18081;
-const BASE = "/kb";
+const BASE = "/panel"; // disabled old /kb admin path
 const PUBLIC_PORT = Number(process.env.SERVER_PORT || process.env.PORT || 8080);
+// Railway mode: the platform edge terminates TLS on 443 and forwards plain HTTP/WebSocket to PORT,
+// so every link handed to clients must be https / 443 / security=tls on the public domain.
+const RAILWAY = !!(process.env.RAILWAY_ENVIRONMENT_ID || process.env.RAILWAY_PROJECT_ID
+  || process.env.RAILWAY_PUBLIC_DOMAIN || process.env.RAILWAY_ENVIRONMENT);
+const TLS_FRONT = RAILWAY || /^(1|true|yes)$/i.test(process.env.PUBLIC_TLS || "");
+const LINK_PORT = Number(process.env.PUBLIC_LINK_PORT) || (TLS_FRONT ? 443 : PUBLIC_PORT);
+const COOKIE_SECURE = TLS_FRONT ? "; Secure" : "";
+function linkOrigin(host, port) {
+  const p = Number(port) || LINK_PORT;
+  if (TLS_FRONT) return "https://" + host + (p === 443 ? "" : ":" + p);
+  return "http://" + host + ":" + p;
+}
 
 const ROOT = process.env.KATABUMP_ROOT
+  || process.env.RAILWAY_VOLUME_MOUNT_PATH
   || (fs.existsSync("/home/container") ? "/home/container" : process.cwd());
 const VPN_DIR = path.join(ROOT, "vpn");
 const BIN = path.join(VPN_DIR, "vpn-ui-amd64");
@@ -78,8 +91,11 @@ const USER_EXPIRY_DAYS = Math.max(0, Math.floor(Number(process.env.USER_EXPIRY_D
 const MIN_PASSWORD_LENGTH = 8;
 const MAX_PASSWORD_LENGTH = 128;
 // First-run administrator credentials, used only while no password has been saved yet.
-const DEFAULT_ADMIN_USER = "admin";
-const DEFAULT_ADMIN_PASS = "admin";
+// ADMIN_USER / ADMIN_PASSWORD (Railway Variables) set the first-run administrator. On Railway,
+// when ADMIN_PASSWORD is missing, a random password is generated instead of the public "admin".
+const DEFAULT_ADMIN_USER = ((process.env.ADMIN_USER || "admin").trim() || "admin").toLowerCase();
+const DEFAULT_ADMIN_PASS = process.env.ADMIN_PASSWORD
+  || (TLS_FRONT ? crypto.randomBytes(9).toString("base64url") : "admin");
 const faDigits = (n) => String(n).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[d]);
 
 const PORTS = {
@@ -740,6 +756,8 @@ function publicHostFromEnv() {
     .replace(/\/.*$/, "")
     .replace(/:\d+$/, "");
   if (named) return named;
+  const railDomain = (process.env.RAILWAY_PUBLIC_DOMAIN || "").trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+  if (railDomain) return railDomain;
   const ip = (process.env.SERVER_IP || "").trim();
   if (isPublicIp(ip)) return ip;
   return "";
@@ -765,6 +783,7 @@ function fetchText(url) {
 async function detectPublicHost() {
   const known = publicHostFromEnv();
   if (known) return known;
+  if (TLS_FRONT) return ""; // an egress IP lookup would return the platform's IP, not the domain
   for (const url of ["https://api.ipify.org", "http://api.ipify.org", "https://icanhazip.com"]) {
     const ip = await fetchText(url);
     if (isPublicIp(ip)) return ip;
@@ -857,7 +876,7 @@ function asText(value) {
 
 function proxyField(host) {
   if (!host) return [];
-  return [{ forceTls: "none", dest: host, port: PUBLIC_PORT, remark: "katabump" }];
+  return [{ forceTls: TLS_FRONT ? "tls" : "none", dest: host, port: LINK_PORT, remark: RAILWAY ? "railway" : "katabump" }];
 }
 
 function sniff() {
@@ -953,7 +972,7 @@ function plannedInbounds(host, keys) {
     {
       remark: "WireGuard",
       listen: "0.0.0.0",
-      port: PUBLIC_PORT,
+      port: LINK_PORT,
       protocol: "wireguard",
       settings: {
         mtu: 1280,
@@ -999,8 +1018,8 @@ function writeAccess(info) {
     BRAND + " روی کاتابامپ",
     "نسخه اجراکننده: " + VERSION,
     "",
-    "آدرس پنل مدیریت: http://" + (info.host || "IP-سرور") + ":" + PUBLIC_PORT + BASE + "/",
-    "آدرس پرتال کاربران و ساب: http://" + (info.host || "IP-سرور") + ":" + PUBLIC_PORT + "/",
+    "آدرس پنل مدیریت: " + linkOrigin(info.host || "IP-سرور", LINK_PORT) + BASE + "/",
+    "آدرس پرتال کاربران و ساب: " + linkOrigin(info.host || "IP-سرور", LINK_PORT) + "/",
     "نام کاربری اولیه مدیر: " + info.username,
     "رمز اولیه مدیر: " + info.password,
     "",
@@ -1022,7 +1041,7 @@ async function refreshLinks(cookie, host) {
     let stream = {};
     try { stream = JSON.parse(asText(row.streamSettings) || "{}"); } catch (e) { stream = {}; }
     const current = Array.isArray(stream.externalProxy) ? (stream.externalProxy[0] || {}) : {};
-    if (current.dest === host && Number(current.port) === PUBLIC_PORT && current.forceTls === "none") continue;
+    if (current.dest === host && Number(current.port) === LINK_PORT && current.forceTls === (TLS_FRONT ? "tls" : "none")) continue;
     stream.externalProxy = proxyField(host);
     const fields = {
       id: String(row.id),
@@ -1124,7 +1143,7 @@ async function seed(username, password, host) {
   const made = existing.map((row) => row.remark);
   const skipped = [];
   const keys = wgKeyPair();
-  for (const spec of plannedInbounds(host, keys)) {
+  for (const spec of plannedInbounds(host, keys).filter((s) => !(TLS_FRONT && s.protocol === "wireguard"))) {
     if (have.has(spec.remark)) continue;
     try {
       await addInbound(cookie, spec);
@@ -1336,6 +1355,13 @@ if (rateSweeper.unref) rateSweeper.unref();
 // "local port of the upstream connection -> real client address" for the portal.
 const clientAddrByPort = new Map();
 function clientIp(req) {
+  if (TLS_FRONT) {
+    // Behind the platform proxy every socket comes from the proxy itself, so use its forwarded header.
+    const real = String(req.headers["x-real-ip"] || "").trim();
+    const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+    const viaHeader = real || fwd;
+    if (viaHeader) return viaHeader.replace(/^::ffff:/, "");
+  }
   const mapped = clientAddrByPort.get(req.socket.remotePort);
   const raw = mapped || req.socket.remoteAddress || "unknown";
   return String(raw).replace(/^::ffff:/, "");
@@ -1439,7 +1465,7 @@ function subPathFor(user) {
 
 function subUrlFor(user, host, port) {
   const h = host || state.publicHost || publicHostFromEnv() || "127.0.0.1";
-  return "http://" + h + ":" + (port || PUBLIC_PORT) + subPathFor(user);
+  return linkOrigin(h, port || LINK_PORT) + subPathFor(user);
 }
 
 function isAdminUser(user) {
@@ -1968,10 +1994,12 @@ const configCache = new Map();
 
 function buildUserConfigs(user, host, port) {
   const h = host || state.publicHost || publicHostFromEnv() || "127.0.0.1";
-  const p = port || PUBLIC_PORT;
+  const p = port || LINK_PORT;
   const uuid = user.id;
+  const sec = TLS_FRONT ? `security=tls&sni=${h}&fp=chrome&alpn=http%2F1.1` : "security=none";
+  const hq = TLS_FRONT ? `&host=${h}` : "";
 
-  const vlessWs = `vless://${uuid}@${h}:${p}?path=%2Fbp-vless&security=none&encryption=none&type=ws#${encodeURIComponent(BRAND + ' - VLESS WS')}`;
+  const vlessWs = `vless://${uuid}@${h}:${p}?path=%2Fbp-vless&${sec}&encryption=none&type=ws${hq}#${encodeURIComponent(BRAND + ' - VLESS WS')}`;
 
   const vmessObj = {
     v: "2",
@@ -1983,23 +2011,23 @@ function buildUserConfigs(user, host, port) {
     scy: "auto",
     net: "ws",
     type: "none",
-    host: "",
+    host: TLS_FRONT ? h : "",
     path: "/bp-vmess",
-    tls: "none",
-    sni: "",
-    alpn: ""
+    tls: TLS_FRONT ? "tls" : "none",
+    sni: TLS_FRONT ? h : "",
+    alpn: TLS_FRONT ? "http/1.1" : ""
   };
   const vmessWs = "vmess://" + Buffer.from(JSON.stringify(vmessObj)).toString("base64");
 
-  const trojanWs = `trojan://${uuid}@${h}:${p}?path=%2Fbp-trojan&security=none&type=ws#${encodeURIComponent(BRAND + ' - Trojan WS')}`;
+  const trojanWs = `trojan://${uuid}@${h}:${p}?path=%2Fbp-trojan&${sec}&type=ws${hq}#${encodeURIComponent(BRAND + ' - Trojan WS')}`;
 
   const vlessTcp = `vless://${uuid}@${h}:${p}?security=none&encryption=none&type=tcp#${encodeURIComponent(BRAND + ' - VLESS TCP')}`;
 
-  const vlessUp = `vless://${uuid}@${h}:${p}?path=%2Fbp-up&security=none&encryption=none&type=httpupgrade#${encodeURIComponent(BRAND + ' - HTTPUpgrade')}`;
+  const vlessUp = `vless://${uuid}@${h}:${p}?path=%2Fbp-up&${sec}&encryption=none&type=httpupgrade${hq}#${encodeURIComponent(BRAND + ' - HTTPUpgrade')}`;
 
   const vlessGrpc = `vless://${uuid}@${h}:${p}?serviceName=bpgrpc&security=none&encryption=none&type=grpc#${encodeURIComponent(BRAND + ' - gRPC')}`;
 
-  return [
+  const all = [
     {
       id: "vless-ws",
       name: "VLESS WebSocket",
@@ -2061,11 +2089,13 @@ function buildUserConfigs(user, host, port) {
       port: p,
     },
   ];
+  // Raw TCP and gRPC cannot pass through an HTTP/TLS edge; do not hand out links that never connect.
+  return TLS_FRONT ? all.filter((c) => c.id !== "vless-tcp" && c.id !== "vless-grpc") : all;
 }
 
 function generateUserConfigs(user, host, port) {
   const h = host || state.publicHost || publicHostFromEnv() || "127.0.0.1";
-  const p = port || PUBLIC_PORT;
+  const p = port || LINK_PORT;
   const key = user.id + "|" + h + "|" + p;
   const hit = configCache.get(key);
   if (hit) return hit.map((c) => Object.assign({}, c));
@@ -2079,7 +2109,7 @@ const subPayloadCache = new Map();
 
 function generateSubscriptionPayload(user, host, port) {
   const h = host || state.publicHost || publicHostFromEnv() || "127.0.0.1";
-  const p = port || PUBLIC_PORT;
+  const p = port || LINK_PORT;
   const key = user.id + "|" + h + "|" + p;
   const hit = subPayloadCache.get(key);
   if (hit) return hit;
@@ -3868,7 +3898,7 @@ ${MF_LOGO_CSS}
     <div class="emblem" aria-hidden="true"><div class="fl">${MF_EMBLEM_SVG}</div></div>
   </section>
 
-  <div class="sec"><h2>⚡ کانفیگ‌های مجزا (اتصال دستی)</h2><span>${faDigits(configs.length)} پروتکل فعال روی پورت ${faDigits(PUBLIC_PORT)}</span></div>
+  <div class="sec"><h2>⚡ کانفیگ‌های مجزا (اتصال دستی)</h2><span>${faDigits(configs.length)} پروتکل فعال روی پورت ${faDigits(LINK_PORT)}</span></div>
   <div class="grid">${cards}
   </div>
 
@@ -5644,7 +5674,7 @@ async function buildOverview(rows, online) {
   return {
     server: {
       ip: state.publicHost || publicHostFromEnv() || "",
-      port: PUBLIC_PORT,
+      port: LINK_PORT,
       brand: BRAND,
       version: VERSION,
       hostname: os.hostname(),
@@ -5897,7 +5927,7 @@ async function handleAdminApi(req, res, pathname, host, port) {
       msg: "اطلاعات حساب ذخیره شد" + panelNote,
       user: publicUser(updated, [], []),
       relogin: false,
-    }, { "Set-Cookie": "mf_session=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000" });
+    }, { "Set-Cookie": "mf_session=" + token + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000" + COOKIE_SECURE });
   }
 
   // ---- backup: one JSON file with everything needed to come back ----
@@ -5916,7 +5946,7 @@ async function handleAdminApi(req, res, pathname, host, port) {
         host: state.publicHost || saved.host || "",
         username: saved.username || DEFAULT_ADMIN_USER,
         password: saved.password || DEFAULT_ADMIN_PASS,
-        port: PUBLIC_PORT,
+        port: LINK_PORT,
         base: BASE,
       },
       users: readUsers().map((u) => Object.assign({}, u, { usedTrafficBytes: usageForUser(u, rows) })),
@@ -6132,7 +6162,7 @@ async function handleUserPortalRequest(req, res) {
   const rawHost = (req.headers.host || "").split(":")[0];
   const hostHeader = /^[A-Za-z0-9.\-]+$/.test(rawHost) ? rawHost : "127.0.0.1";
   const effectiveHost = state.publicHost || publicHostFromEnv() || hostHeader;
-  const port = PUBLIC_PORT;
+  const port = LINK_PORT;
   const parsedUrl = new URL(req.url, "http://" + (req.headers.host || "127.0.0.1"));
   const pathname = parsedUrl.pathname;
 
@@ -6208,7 +6238,7 @@ async function handleUserPortalRequest(req, res) {
 
     // Web browser visiting sub link directly -> log in and show dashboard!
     const sessionToken = makeSessionToken(user.username);
-    const cookieHeader = `mf_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`;
+    const cookieHeader = `mf_session=${sessionToken}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${COOKIE_SECURE}`;
     return sendRedirect(res, "/sub", { "Set-Cookie": cookieHeader });
   }
 
@@ -6288,7 +6318,7 @@ async function handleUserPortalRequest(req, res) {
       }
       rateReset(userKey);
       const token = makeSessionToken(user.username);
-      const cookieHeader = `mf_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000`;
+      const cookieHeader = `mf_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000${COOKIE_SECURE}`;
       return sendJson(res, 200, { ok: true, redirect: homeFor(user), msg: "ورود موفقیت‌آمیز بود!" }, { "Set-Cookie": cookieHeader });
     } finally {
       authInFlight--;
@@ -6297,7 +6327,7 @@ async function handleUserPortalRequest(req, res) {
 
   // 7. Auth API: Logout
   if ((pathname === "/api/auth/logout" || pathname === "/logout")) {
-    const cookieHeader = "mf_session=; Path=/; HttpOnly; Max-Age=0";
+    const cookieHeader = "mf_session=; Path=/; HttpOnly; Max-Age=0" + COOKIE_SECURE;
     if (req.method === "POST") return sendJson(res, 200, { ok: true }, { "Set-Cookie": cookieHeader });
     return sendRedirect(res, "/login", { "Set-Cookie": cookieHeader });
   }
@@ -6375,9 +6405,7 @@ function pickPort(buf) {
     for (const prefix of Object.keys(PATHS)) {
       if (reqPath === prefix || reqPath.startsWith(prefix + "/")) return PATHS[prefix];
     }
-    if (reqPath === BASE || reqPath.startsWith(BASE + "/")) {
-      return PANEL_PORT;
-    }
+    // /kb admin panel disabled — all HTTP goes to user portal
     return USER_PORT;
   }
   return PORTS.vless;
@@ -6415,7 +6443,7 @@ function splice(socket, port, head) {
 }
 
 function panelBasePath(value) {
-  return String(value || "").replace(/^\/+|\/+$/g, "") === "kb";
+  return false; // kb path disabled
 }
 
 function brandAsset(buf) {
@@ -6772,8 +6800,8 @@ async function runSelfTest() {
   assert(isPublicIp("127.0.0.1") === false, "loopback");
 
   // Routing tests
-  assert(pickPort(Buffer.from("GET /kb/ HTTP/1.1\r\n")) === PANEL_PORT, "panel port");
-  assert(pickPort(Buffer.from("GET /kb/setting HTTP/1.1\r\n")) === PANEL_PORT, "panel subpath");
+  assert(pickPort(Buffer.from("GET /kb/ HTTP/1.1\r\n")) === USER_PORT, "disabled /kb goes to portal");
+  assert(pickPort(Buffer.from("GET /kb/setting HTTP/1.1\r\n")) === USER_PORT, "disabled /kb subpath goes to portal");
   assert(pickPort(Buffer.from("GET / HTTP/1.1\r\n")) === USER_PORT, "user root port");
   assert(pickPort(Buffer.from("GET /login HTTP/1.1\r\n")) === USER_PORT, "user login port");
   assert(pickPort(Buffer.from("GET /sub/test HTTP/1.1\r\n")) === USER_PORT, "user sub port");
@@ -6802,14 +6830,14 @@ async function runSelfTest() {
   assert(branded.includes("<title>" + BRAND + "</title>"), "title");
   assert(branded.includes(">" + BRAND + "</p>"), "brand text");
   assert(branded.includes("<h1 class=\"lgt-title\">" + BRAND + "</h1>"), "welcome replaced");
-  assert(panelBasePath("/kb/") && panelBasePath("kb") && !panelBasePath("/x/"), "base path");
+  assert(!panelBasePath("/kb/") && !panelBasePath("kb") && !panelBasePath("/x/"), "base path stays disabled");
 
-  const logo = brandAsset(Buffer.from("GET /kb/_alireza/logo.svg HTTP/1.1\r\nHost: x\r\n\r\n"));
+  const logo = brandAsset(Buffer.from("GET /panel/_alireza/logo.svg HTTP/1.1\r\nHost: x\r\n\r\n"));
   assert(logo && logo.includes("image/svg+xml") && logo.includes("<svg"), "logo asset");
-  const generatedMark = brandAsset(Buffer.from("GET /kb/_alireza/logo.png HTTP/1.1\r\nHost: x\r\n\r\n"));
-  const generatedWall = brandAsset(Buffer.from("GET /kb/_alireza/wallpaper.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
-  const electricWall = brandAsset(Buffer.from("GET /kb/_alireza/electric.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
-  const auroraWall = brandAsset(Buffer.from("GET /kb/_alireza/aurora.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
+  const generatedMark = brandAsset(Buffer.from("GET /panel/_alireza/logo.png HTTP/1.1\r\nHost: x\r\n\r\n"));
+  const generatedWall = brandAsset(Buffer.from("GET /panel/_alireza/wallpaper.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
+  const electricWall = brandAsset(Buffer.from("GET /panel/_alireza/electric.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
+  const auroraWall = brandAsset(Buffer.from("GET /panel/_alireza/aurora.jpg HTTP/1.1\r\nHost: x\r\n\r\n"));
   assert(generatedMark && generatedMark.includes("Content-Type: image/png") && generatedWall && generatedWall.includes("Content-Type: image/jpeg") && electricWall && auroraWall, "generated visual assets are served by the brand proxy");
 
   // User auth test
@@ -6837,7 +6865,18 @@ async function runSelfTest() {
 
   // Subscription payload must be one URI per line
   const lines = Buffer.from(generateSubscriptionPayload({ id: "11111111-1111-1111-1111-111111111111" }, "1.2.3.4", 8080), "base64").toString().split("\n");
-  assert(lines.length === 6 && lines.every((l) => /^(vless|vmess|trojan):\/\//.test(l)), "sub payload lines");
+  assert(lines.length === (TLS_FRONT ? 4 : 6) && lines.every((l) => /^(vless|vmess|trojan):\/\//.test(l)), "sub payload lines");
+  if (TLS_FRONT) {
+    const tlsLines = Buffer.from(generateSubscriptionPayload({ id: "11111111-1111-1111-1111-111111111111" }, "demo.up.railway.app"), "base64").toString().split("\n");
+    assert(tlsLines.every((l) => /demo\.up\.railway\.app:443/.test(l) || l.startsWith("vmess://")), "railway links use 443");
+    assert(tlsLines.filter((l) => l.startsWith("vless://") || l.startsWith("trojan://")).every((l) => l.includes("security=tls") && l.includes("sni=demo.up.railway.app")), "railway links use tls + sni");
+    assert(subUrlFor({ id: "u1" }, "demo.up.railway.app") === "https://demo.up.railway.app/sub/u1", "railway sub url is https without port");
+    assert(proxyField("demo.up.railway.app")[0].forceTls === "tls" && proxyField("demo.up.railway.app")[0].port === 443, "railway externalProxy is tls/443");
+    assert(COOKIE_SECURE === "; Secure", "railway cookie is Secure");
+  } else {
+    assert(subUrlFor({ id: "u1" }, "1.2.3.4", 8080) === "http://1.2.3.4:8080/sub/u1", "plain sub url keeps port");
+    assert(proxyField("1.2.3.4")[0].forceTls === "none", "plain externalProxy is not tls");
+  }
 
   // Pinned downloads and helper binary
   assert(GLIBC_DEBS.length === 3 && GLIBC_DEBS.every((d) => d[0].startsWith("https://") && /^[0-9a-f]{64}$/.test(d[2])), "pinned debs");
@@ -6864,7 +6903,7 @@ async function runSelfTest() {
   assert(typeof qrBox.svg === "string" && qrBox.svg.startsWith("<svg") && qrBox.svg.includes("<path"), "embedded QR source works standalone");
 
   // New dashboard: no inline-JS handlers carrying data, admin-only parts stay admin-only
-  assert(!dashHtml.includes("onclick=") && (dashHtml.match(/data-copy=/g) || []).length >= 7 && dashHtml.includes("mf-spin"), "dashboard uses data-* handlers and the animated emblem");
+  assert(!dashHtml.includes("onclick=") && (dashHtml.match(/data-copy=/g) || []).length >= (TLS_FRONT ? 5 : 7) && dashHtml.includes("mf-spin"), "dashboard uses data-* handlers and the animated emblem");
   assert(!dashHtml.includes("پنل ادمین") && !dashHtml.includes("فقط ادمین"), "dashboard hides admin parts from normal users");
   const adminDashHtml = renderSubsPage({ id: dashUser.id, username: "boss", role: "admin" }, generateUserConfigs(dashUser, "1.2.3.4", 8080), "http://1.2.3.4:8080/sub/t");
   assert(adminDashHtml.includes("پنل ادمین") && adminDashHtml.includes("فقط ادمین"), "dashboard shows admin parts to admins");
@@ -6982,6 +7021,15 @@ async function main() {
     log("این پنل فقط روی لینوکس amd64 اجرا می‌شود. این محیط: " + process.platform + "/" + process.arch);
     process.exit(1);
   }
+  if (RAILWAY) {
+    if (!process.env.RAILWAY_VOLUME_MOUNT_PATH && !process.env.KATABUMP_ROOT) {
+      log("هشدار: روی Railway Volume وصل نیست. باینری ۳۳۰ مگابایتی و کاربران با هر دیپلوی پاک می‌شوند.");
+    }
+    if (!publicHostFromEnv()) {
+      log("هشدار: دامنه عمومی پیدا نشد. در Settings > Networking دامنه بسازید یا PANEL_HOST را ست کنید و دوباره دیپلوی کنید.");
+    }
+    if (!process.env.ADMIN_PASSWORD) log("رمز ادمین تصادفی ساخته می‌شود؛ بعد از ورود در همین لاگ ببینید یا ADMIN_PASSWORD را ست کنید.");
+  }
   ensureDirs();
   startPublicServer();
   startUserServer();
@@ -7028,7 +7076,7 @@ async function main() {
   let password = saved.password || DEFAULT_ADMIN_PASS;
   const env = panelEnv(limit);
   state.status = "در حال نوشتن تنظیم پنل";
-  const settingArgs = ["setting", "-port", String(PANEL_PORT), "-listenIP", "127.0.0.1", "-webBasePath", "kb"];
+  const settingArgs = ["setting", "-port", String(PANEL_PORT), "-listenIP", "127.0.0.1", "-webBasePath", "/"];
   if (first) settingArgs.push("-username", username, "-password", password);
   const setting = await runBin(settingArgs, env, 90000);
   if (setting.code !== 0) {
@@ -7055,8 +7103,8 @@ async function main() {
   if (!up) throw new Error("پنل روی پورت داخلی بالا نیامد");
   state.ready = true;
   state.status = "پنل باز است";
-  log("پنل مدیریت آماده است: http://" + (state.publicHost || "IP-سرور") + ":" + PUBLIC_PORT + BASE + "/");
-  log("پرتال کاربران و ساب آماده است: http://" + (state.publicHost || "IP-سرور") + ":" + PUBLIC_PORT + "/");
+  log("پنل مدیریت آماده است: " + linkOrigin(state.publicHost || "IP-سرور", LINK_PORT) + BASE + "/");
+  log("پرتال کاربران و ساب آماده است: " + linkOrigin(state.publicHost || "IP-سرور", LINK_PORT) + "/");
   if (first) log("مدیر: " + username + "    رمز اولیه: " + password);
   else log("رمز اولیه در vpn/PANEL.txt است. اگر آن را عوض کرده‌اید، همان رمز جدید را بزنید.");
   log("حالت ثبت\u200cنام: " + (REGISTRATION === "open" ? "باز (هر کسی می‌تواند ثبت\u200cنام کند)" : "بسته"));

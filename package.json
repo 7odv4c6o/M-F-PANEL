@@ -1,8 +1,8 @@
 {
   "name": "mf-panel",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "private": true,
-  "description": "M&F Panel",
+  "description": "M&F Panel (Katabump / Railway runner)",
   "main": "index.js",
   "scripts": {
     "start": "node --trace-uncaught index.js",
